@@ -12,6 +12,8 @@ services:
       sizeGB: 2
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: AIRTABLE_API_KEY
         sync: false
       - key: AIRTABLE_BASE_ID
