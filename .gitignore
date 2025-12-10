@@ -1,0 +1,25 @@
+# Environment and secrets
+.env
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Cache and models
+cache/
+model/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.swp
