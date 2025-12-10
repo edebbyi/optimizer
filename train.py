@@ -7,6 +7,7 @@ import os
 import json
 import logging
 import pickle
+import hashlib
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
@@ -33,10 +34,10 @@ from config import (
 from airtable_client import (
     AirtableClient,
     get_image_url,
-    get_image_attachment_data,
     get_structure_id,
     get_label,
-    get_structure_metadata
+    get_structure_metadata,
+    get_image_attachment_data
 )
 from feature_extraction import (
     extract_all_features,
@@ -50,6 +51,36 @@ logger = logging.getLogger(__name__)
 def ensure_model_dir():
     """Create model directory if it doesn't exist."""
     os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def extract_prompt_text(image_record: Dict) -> str:
+    """
+    Extract prompt text from image record, handling lookup field formats.
+    
+    Airtable lookup fields return arrays, so this handles:
+    - String: "A minimalist jacket..." → returns as-is
+    - List: ["A minimalist jacket..."] → extracts first element
+    - None/empty: returns empty string
+    
+    Args:
+        image_record: Image record from Airtable
+        
+    Returns:
+        Prompt text as string
+    """
+    prompt_raw = image_record.get(ImageFields.PROMPT, "") or ""
+    
+    # Handle lookup field returning as list
+    if isinstance(prompt_raw, list):
+        prompt_text = prompt_raw[0] if prompt_raw else ""
+    else:
+        prompt_text = prompt_raw
+    
+    # Ensure it's a string
+    if not isinstance(prompt_text, str):
+        return ""
+    
+    return prompt_text.strip()
 
 
 def parse_created_timestamp(ts: Any) -> datetime:
@@ -136,6 +167,92 @@ def compute_global_preference_vector(
     return global_pref
 
 
+def compute_prompt_success_rates(sample_metadata: List[Dict]) -> Dict[str, Dict]:
+    """
+    Aggregate success rates by prompt_hash AND by structure.
+    
+    Args:
+        sample_metadata: List of sample metadata dicts from training
+        
+    Returns:
+        Tuple of:
+        - prompt_stats: Dict mapping prompt_hash to success stats
+        - structure_prompt_stats: Dict mapping structure_id to top prompts for that structure
+    """
+    from collections import defaultdict
+    
+    prompt_stats = defaultdict(lambda: {
+        "total": 0, 
+        "positive": 0, 
+        "prompt_preview": "",
+        "structure_ids": set()
+    })
+    
+    # Track by structure → prompt
+    structure_prompt_stats = defaultdict(lambda: defaultdict(lambda: {
+        "total": 0,
+        "positive": 0,
+        "prompt_preview": ""
+    }))
+    
+    for sample in sample_metadata:
+        ph = sample.get("prompt_hash")
+        struct_id = sample.get("structure_id")
+        label = sample.get("label", 0)
+        preview = sample.get("prompt_preview", "")
+        
+        if not ph:
+            continue
+        prompt_stats[ph]["total"] += 1
+        prompt_stats[ph]["positive"] += label
+        prompt_stats[ph]["prompt_preview"] = preview
+        if struct_id:
+            prompt_stats[ph]["structure_ids"].add(struct_id)
+        
+        if struct_id:
+            structure_prompt_stats[struct_id][ph]["total"] += 1
+            structure_prompt_stats[struct_id][ph]["positive"] += label
+            structure_prompt_stats[struct_id][ph]["prompt_preview"] = preview
+    
+    # Compute success rate and format results
+    prompt_results = {}
+    for ph, stats in prompt_stats.items():
+        if stats["total"] >= 2:  # Only include prompts with 2+ images
+            prompt_results[ph] = {
+                "success_rate": round(stats["positive"] / stats["total"], 4),
+                "sample_count": stats["total"],
+                "positive_count": stats["positive"],
+                "prompt_preview": stats["prompt_preview"],
+                "structure_ids": list(stats["structure_ids"])
+            }
+    
+    # Structure-level aggregation
+    structure_results = {}
+    for struct_id, prompts in structure_prompt_stats.items():
+        struct_prompts = []
+        for ph, stats in prompts.items():
+            if stats["total"] >= 2:
+                struct_prompts.append({
+                    "prompt_hash": ph,
+                    "prompt_preview": stats["prompt_preview"],
+                    "success_rate": round(stats["positive"] / stats["total"], 4),
+                    "sample_count": stats["total"]
+                })
+        
+        if struct_prompts:
+            struct_prompts.sort(key=lambda x: x["success_rate"], reverse=True)
+            all_rates = [p["success_rate"] for p in struct_prompts]
+            structure_results[str(struct_id)] = {
+                "top_prompts": struct_prompts[:5],
+                "avg_success_rate": round(sum(all_rates) / len(all_rates), 4) if all_rates else 0
+            }
+    
+    # Sort by success_rate descending
+    prompt_results = dict(sorted(prompt_results.items(), key=lambda x: x[1]["success_rate"], reverse=True))
+    
+    return prompt_results, structure_results
+
+
 def build_training_data(
     images: List[Dict],
     structures_by_id: Dict[int, Dict],
@@ -198,7 +315,7 @@ def build_training_data(
         
         # Extract features
         try:
-            prompt_text = img.get(ImageFields.PROMPT, "") or ""
+            prompt_text = extract_prompt_text(img)
             skeleton_text = structure.get(StructureFields.SKELETON, "") or ""
             struct_metadata = get_structure_metadata(structure)
             
@@ -212,9 +329,14 @@ def build_training_data(
             
             X.append(features)
             y.append(label)
+            # Generate prompt hash for prompt-level tracking
+            prompt_hash = hashlib.md5(prompt_text.encode()).hexdigest()[:12] if prompt_text else None
+            
             metadata.append({
                 "image_name": img.get(ImageFields.NAME, ""),
                 "structure_id": struct_id,
+                "prompt_hash": prompt_hash,
+                "prompt_preview": prompt_text[:150] if prompt_text else "",
                 "label": label
             })
             
@@ -227,9 +349,15 @@ def build_training_data(
             logger.warning(f"Error processing image {img.get(ImageFields.NAME, 'unknown')}: {e} — using zero features")
             X.append(np.zeros(TOTAL_FEATURE_DIM, dtype=np.float32))
             y.append(label)
+            # Generate prompt hash even for failed extractions
+            prompt_text = extract_prompt_text(img)
+            prompt_hash = hashlib.md5(prompt_text.encode()).hexdigest()[:12] if prompt_text else None
+            
             metadata.append({
                 "image_name": img.get(ImageFields.NAME, ""),
                 "structure_id": struct_id,
+                "prompt_hash": prompt_hash,
+                "prompt_preview": prompt_text[:150] if prompt_text else "",
                 "label": label,
                 "warning": str(e)
             })
@@ -332,7 +460,9 @@ def save_model(
     model: xgb.XGBClassifier,
     scaler: StandardScaler,
     metrics: Dict[str, Any],
-    global_pref: Dict[str, float]
+    global_pref: Dict[str, float],
+    prompt_stats: Dict[str, Dict],
+    structure_prompt_stats: Dict[str, Dict]
 ):
     """
     Save trained model and associated data.
@@ -369,6 +499,17 @@ def save_model(
     with open(GLOBAL_PREF_PATH, "w") as f:
         json.dump(global_pref, f, indent=2)
     logger.info(f"Global preference vector saved to {GLOBAL_PREF_PATH}")
+
+    # Save prompt success rates
+    from config import PROMPT_STATS_PATH, STRUCTURE_PROMPT_STATS_PATH
+    with open(PROMPT_STATS_PATH, "w") as f:
+        json.dump(prompt_stats, f, indent=2)
+    logger.info(f"Prompt success rates saved to {PROMPT_STATS_PATH}")
+    
+    # Save structure-specific prompt insights
+    with open(STRUCTURE_PROMPT_STATS_PATH, "w") as f:
+        json.dump(structure_prompt_stats, f, indent=2)
+    logger.info(f"Structure prompt insights saved to {STRUCTURE_PROMPT_STATS_PATH}")
 
 
 def get_feature_importance(model: xgb.XGBClassifier, top_n: int = 20) -> List[Dict]:
@@ -443,11 +584,15 @@ def train_model() -> Dict[str, Any]:
         # Compute global preference vector
         global_pref = compute_global_preference_vector(images_sorted, structures_by_id)
         
+        # Compute prompt-level success rates (both views)
+        prompt_stats, structure_prompt_stats = compute_prompt_success_rates(sample_metadata)
+        logger.info(f"Computed success rates for {len(prompt_stats)} unique prompts across {len(structure_prompt_stats)} structures")
+        
         # Train model
         model, scaler, metrics = train_xgboost_model(X, y)
         
         # Save everything
-        save_model(model, scaler, metrics, global_pref)
+        save_model(model, scaler, metrics, global_pref, prompt_stats, structure_prompt_stats)
         
         logger.info("=" * 60)
         logger.info("Training complete!")

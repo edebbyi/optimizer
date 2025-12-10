@@ -53,6 +53,8 @@ pip install -r requirements.txt
 - `POST /train` → triggers training, writes artifacts to `model/`.
 - `POST /score_structures` → scores active structures, returns `predicted_success_score` and preference vector.
 - `GET /preferences` → current global preference vector.
+- `GET /prompts/top` → top-performing prompts by success rate.
+- `GET /structure_prompt_insights` → structure-specific prompt performance data.
 - `DELETE /cache` → clear CLIP/GPT‑4V caches.
 
 ## n8n Integration

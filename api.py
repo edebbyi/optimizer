@@ -260,6 +260,106 @@ async def get_global_preferences():
     }
 
 
+@app.get("/prompts/top")
+async def get_top_prompts(limit: int = 20, min_samples: int = 2):
+    """
+    Get prompts with highest success rates.
+    
+    Args:
+        limit: Maximum number of prompts to return (default 20)
+        min_samples: Minimum sample count to include (default 2)
+        
+    Returns:
+        Top performing prompts sorted by success rate
+    """
+    from config import PROMPT_STATS_PATH
+    from utils import load_json_file
+    
+    stats = load_json_file(PROMPT_STATS_PATH)
+    
+    if stats is None:
+        return {
+            "status": "not_computed",
+            "message": "Prompt stats not computed. Call POST /train first."
+        }
+    
+    # Filter by min_samples and limit
+    filtered = {
+        k: v for k, v in stats.items() 
+        if v.get("sample_count", 0) >= min_samples
+    }
+    
+    top_prompts = dict(list(filtered.items())[:limit])
+    
+    # Also get bottom performers for contrast
+    bottom_prompts = dict(list(filtered.items())[-5:]) if len(filtered) > 5 else {}
+    
+    return {
+        "status": "computed",
+        "top_prompts": top_prompts,
+        "bottom_prompts": bottom_prompts,
+        "total_unique_prompts": len(stats),
+        "prompts_with_min_samples": len(filtered)
+    }
+
+
+@app.get("/prompts/{prompt_hash}")
+async def get_prompt_stats(prompt_hash: str):
+    """
+    Get stats for a specific prompt by hash.
+    
+    Args:
+        prompt_hash: 12-character MD5 hash of prompt text
+    """
+    from config import PROMPT_STATS_PATH
+    from utils import load_json_file
+    
+    stats = load_json_file(PROMPT_STATS_PATH)
+    
+    if stats is None:
+        return {
+            "status": "not_computed",
+            "message": "Prompt stats not computed. Call POST /train first."
+        }
+    
+    if prompt_hash not in stats:
+        return {
+            "status": "not_found",
+            "message": f"Prompt hash {prompt_hash} not found"
+        }
+    
+    return {
+        "status": "found",
+        "prompt_hash": prompt_hash,
+        "stats": stats[prompt_hash]
+    }
+
+
+@app.get("/structure_prompt_insights")
+async def get_structure_prompt_insights():
+    """
+    Get prompt success insights grouped by structure.
+    
+    Returns top-performing prompts for each structure.
+    """
+    from config import STRUCTURE_PROMPT_STATS_PATH
+    from utils import load_json_file
+    
+    stats = load_json_file(STRUCTURE_PROMPT_STATS_PATH)
+    
+    if stats is None:
+        return {
+            "status": "not_computed",
+            "message": "Structure prompt insights not computed. Call POST /train first."
+        }
+    
+    return {
+        "status": "computed",
+        "structure_count": len(stats),
+        "insights": stats
+    }
+
+
 @app.delete("/cache")
 async def clear_cache(cache_type: str = "all"):
     """
