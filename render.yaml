@@ -4,7 +4,7 @@ services:
     env: python
     pythonVersion: 3.11.9
     plan: starter
-    region: oregon
+    region: virginia
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     envVars:
